@@ -380,10 +380,12 @@ static uint8_t ratelimit_reached(request_st * const r, plugin_data *p) {
 		}
         uint8_t reached = cur_ts <= p->ratelimit_backoff_until;
         if (reached) {
+            time_t remains = p->ratelimit_backoff_until - cur_ts;
+
             log_error(r->conf.errh, __FILE__, __LINE__,
-                "ratelimit_reached. requests: %d, until: %ld, IP: %s",
+                "ratelimit_reached. requests: %d, until: %ld, IP: %s, remains: %ld",
                 p->ratelimit_failed_requests, p->ratelimit_backoff_until,
-                r->con->dst_addr_buf.ptr);
+                r->con->dst_addr_buf.ptr, remains);
         }
 		return reached;
 	}
@@ -1159,6 +1161,22 @@ mod_auth_digest_www_authenticate (buffer *b, unix_time64_t cur_ts, const struct 
     }
 }
 
+__attribute_noinline__
+static handler_t
+mod_auth_send_429_too_many_requests(request_st * const r, const struct http_auth_require_t * const require, plugin_data *p)
+{
+    r->http_status = 429;
+    r->handler_module = NULL;
+    
+    time_t cur_ts = ratelimit_current_time();
+    uint8_t remains = p->ratelimit_backoff_until - cur_ts;
+
+    char ra[16];
+    sprintf(ra,"%ld", remains);
+    http_header_response_set(r, HTTP_HEADER_CONTENT_RANGE,
+                             CONST_STR_LEN("Retry-After"), ra, sizeof(ra));
+    return HANDLER_FINISHED;
+}
 
 __attribute_noinline__
 static handler_t
@@ -1563,7 +1581,7 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
         return mod_auth_digest_misconfigured(r, backend);
 
     if (ratelimit_reached(r, p_d))
-		return mod_auth_send_401_unauthorized_digest(r, require, 0);
+		return mod_auth_send_429_too_many_requests(r, require, p_d);
 
     const buffer * const vb =
       http_header_request_get(r, HTTP_HEADER_AUTHORIZATION,
