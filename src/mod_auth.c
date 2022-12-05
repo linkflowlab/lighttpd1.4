@@ -9,6 +9,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "mod_auth_api.h"
 #include "sys-crypto-md.h" /* USE_LIB_CRYPTO */
@@ -41,6 +42,11 @@ typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
     plugin_config conf;
+
+	int ratelimit_allowed_fails;
+	int ratelimit_backoff_sec;
+	int ratelimit_failed_requests;
+	time_t ratelimit_backoff_until;
 } plugin_data;
 
 typedef struct {
@@ -233,6 +239,11 @@ INIT_FUNC(mod_auth_init) {
 	http_auth_scheme_set(&http_auth_scheme_digest);
 	http_auth_scheme_set(&http_auth_scheme_extern);
 
+	p->ratelimit_failed_requests = 0;
+	p->ratelimit_backoff_until = 0;
+	p->ratelimit_allowed_fails = 5; // hardcoded. -1;
+	p->ratelimit_backoff_sec = 300; // 0
+
 	return p;
 }
 
@@ -353,6 +364,54 @@ static int mod_auth_algorithms_parse(int *algorithm, buffer *algos) {
     }
     return 1;
 }
+
+static time_t ratelimit_current_time() {
+		struct timespec tp;
+		clock_gettime(CLOCK_MONOTONIC, &tp);
+		return tp.tv_sec;
+}
+
+static uint8_t ratelimit_reached(request_st * const r, plugin_data *p) {
+	if (p->ratelimit_backoff_until > 0) {
+		time_t cur_ts = ratelimit_current_time();
+		if (cur_ts > p->ratelimit_backoff_until) {
+			p->ratelimit_failed_requests = 0;
+			p->ratelimit_backoff_until = 0;
+		}
+        uint8_t reached = cur_ts <= p->ratelimit_backoff_until;
+        if (reached) {
+            log_error(r->conf.errh, __FILE__, __LINE__,
+                "ratelimit_reached. requests: %d, until: %ld, IP: %s",
+                p->ratelimit_failed_requests, p->ratelimit_backoff_until,
+                r->con->dst_addr_buf.ptr);
+        }
+		return reached;
+	}
+	return 0;
+}
+
+static void ratelimit_auth_failed(request_st * const r, plugin_data *p) {
+	if (p->ratelimit_allowed_fails < 0)
+		return;
+	if (p->ratelimit_failed_requests > p->ratelimit_allowed_fails)
+		p->ratelimit_backoff_until = ratelimit_current_time() + p->ratelimit_backoff_sec;
+	else
+		p->ratelimit_failed_requests += 1;
+
+    log_error(r->conf.errh, __FILE__, __LINE__,
+        "ratelimit_auth_failed. requests: %d, until: %ld, IP: %s",
+        p->ratelimit_failed_requests, p->ratelimit_backoff_until,
+        r->con->dst_addr_buf.ptr);
+}
+
+static void ratelimit_auth_ok(request_st * const r, plugin_data *p) {
+	p->ratelimit_failed_requests = 0;
+	p->ratelimit_backoff_until = 0;
+
+    log_error(r->conf.errh, __FILE__, __LINE__,
+        "ratelimit_auth_ok. IP: %s", r->con->dst_addr_buf.ptr);
+}
+
 
 static int mod_auth_require_parse (http_auth_require_t * const require, const buffer *b, log_error_st *errh)
 {
@@ -774,6 +833,9 @@ mod_auth_check_basic(request_st * const r, void *p_d, const struct http_auth_req
     if (NULL == backend || NULL == backend->basic)
         return mod_auth_basic_misconfigured(r, backend);
 
+    if (ratelimit_reached(r, p_d))
+		return mod_auth_send_401_unauthorized_basic(r, require->realm);
+
     const buffer * const vb =
       http_header_request_get(r, HTTP_HEADER_AUTHORIZATION,
                               CONST_STR_LEN("Authorization"));
@@ -843,6 +905,7 @@ mod_auth_check_basic(request_st * const r, void *p_d, const struct http_auth_req
                                             pw, pwlen);
             http_auth_cache_insert(sptree, ndx, ae, http_auth_cache_entry_free);
         }
+        ratelimit_auth_ok(r, p_d);
         break;
     case HANDLER_WAIT_FOR_EVENT:
     case HANDLER_FINISHED:
@@ -854,6 +917,8 @@ mod_auth_check_basic(request_st * const r, void *p_d, const struct http_auth_req
           r->uri.path.ptr, user, r->con->dst_addr_buf.ptr);
         r->keep_alive = -1; /*(disable keep-alive if bad password)*/
         rc = mod_auth_send_401_unauthorized_basic(r, require->realm);
+
+        ratelimit_auth_failed(r, p_d);
         break;
     }
 
@@ -1497,11 +1562,16 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
     if (NULL == backend || NULL == backend->digest)
         return mod_auth_digest_misconfigured(r, backend);
 
+    if (ratelimit_reached(r, p_d))
+		return mod_auth_send_401_unauthorized_digest(r, require, 0);
+
     const buffer * const vb =
       http_header_request_get(r, HTTP_HEADER_AUTHORIZATION,
                               CONST_STR_LEN("Authorization"));
-    if (NULL == vb || !buffer_eq_icase_ssn(vb->ptr, CONST_STR_LEN("Digest ")))
+    if (NULL == vb || !buffer_eq_icase_ssn(vb->ptr, CONST_STR_LEN("Digest "))) {
+        ratelimit_auth_failed(r, p_d);
         return mod_auth_send_401_unauthorized_digest(r, require, 0);
+    }
   #ifdef __COVERITY__
     if (buffer_clen(vb) < sizeof("Digest ")-1)
         return mod_auth_send_400_bad_request(r);
@@ -1537,6 +1607,7 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
           "digest: auth failed for %.*s: wrong password, IP: %s",
           (int)ai.ulen, ai.username, r->con->dst_addr_buf.ptr);
         r->keep_alive = -1; /*(disable keep-alive if bad password)*/
+        ratelimit_auth_failed(r, p_d);
         return mod_auth_send_401_unauthorized_digest(r, require, 0);
     }
     /*ck_memzero(ai.digest, ai.dlen);*//* skip clear since mutated */
@@ -1544,8 +1615,10 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
     /* check authorization (authz); string args must be '\0'-terminated) */
     buffer * const tb = r->tmp_buf;
     buffer_copy_string_len(tb, ai.username, ai.ulen);
-    if (!http_auth_match_rules(require, tb->ptr, NULL, NULL))
+    if (!http_auth_match_rules(require, tb->ptr, NULL, NULL)) {
+        ratelimit_auth_failed(r, p_d);
         return mod_auth_send_401_unauthorized_digest(r, require, 0);
+    }
 
     if (dp.send_nextnonce_ts) {
         /*(send nextnonce when expiration is approaching)*/
@@ -1556,6 +1629,7 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
     }
 
     http_auth_setenv(r, ai.username, ai.ulen, CONST_STR_LEN("Digest"));
+    ratelimit_auth_ok(r, p_d);
     return HANDLER_GO_ON;
 }
 
