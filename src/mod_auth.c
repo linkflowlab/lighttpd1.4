@@ -22,9 +22,13 @@
 #include "plugin.h"
 #include "plugin_config.h"
 
+#include "map.h"
+
 /**
  * auth framework
  */
+
+#define LOGIN_TIMEOUT (600)
 
 typedef struct {
     splay_tree *sptree; /* data in nodes of tree are (http_auth_cache_entry *)*/
@@ -43,11 +47,19 @@ typedef struct {
     plugin_config defaults;
     plugin_config conf;
 
+    map_void_t logins;
 	int ratelimit_allowed_fails;
 	int ratelimit_backoff_sec;
 	int ratelimit_failed_requests;
 	time_t ratelimit_backoff_until;
 } plugin_data;
+
+// key : nonce
+typedef struct {
+    unix_time64_t created_time;
+    unix_time64_t last_time;
+    long int last_nc;
+} login_entry;
 
 typedef struct {
     const struct http_auth_require_t *require;
@@ -196,7 +208,7 @@ mod_auth_periodic_cleanup(splay_tree **sptree_ptr, const time_t max_age, const u
 
 TRIGGER_FUNC(mod_auth_periodic)
 {
-    const plugin_data * const p = p_d;
+    plugin_data * const p = p_d;
     const unix_time64_t cur_ts = log_monotonic_secs;
     if (cur_ts & 0x7) return HANDLER_GO_ON; /*(continue once each 8 sec)*/
     UNUSED(srv);
@@ -213,6 +225,51 @@ TRIGGER_FUNC(mod_auth_periodic)
             http_auth_cache *ac = cpv->v.v;
             mod_auth_periodic_cleanup(&ac->sptree, ac->max_age, cur_ts);
         }
+    }
+
+    // clean up
+    {
+        const char *key;
+        map_iter_t iter = map_iter(&p->logins);
+
+        while ((key = map_next(&p->logins, &iter))) {
+            login_entry *entry = *map_get(&p->logins, key);
+
+            if (entry->last_time == 0) {
+                if ((log_monotonic_secs - entry->created_time) > LOGIN_TIMEOUT) {
+                    log_error(srv->errh, __FILE__, __LINE__,
+                        "cleanup: entry->created_time is over 600 secs. remove unused entry. nonce: %s, created_time: %d", key, entry->created_time);
+
+                    // delete the entry
+                    map_remove(&((plugin_data *)p_d)->logins, key);
+                    continue;
+                }
+            }
+
+            if (entry->last_time != 0) {
+                if ((log_monotonic_secs - entry->last_time) > LOGIN_TIMEOUT) {
+                    log_error(srv->errh, __FILE__, __LINE__,
+                        "cleanup: entry->last_time is over 600 secs. remove old entry nonce: %s, last_time: %d", key, entry->last_time);
+
+                    // delete the entry
+                    map_remove(&((plugin_data *)p_d)->logins, key);
+                    continue;
+                }
+            }
+        }
+
+        // debug log
+        int count = 0;
+        iter = map_iter(&p->logins);
+        while ((key = map_next(&p->logins, &iter))) {
+            count++;
+            login_entry *entry = *map_get(&p->logins, key);
+            log_error(srv->errh, __FILE__, __LINE__,
+                "login entry. nonce: `%s`, nc: %ld, created_time: %d, last_time:%d", key, entry->last_nc, entry->created_time, entry->last_time);
+        }
+
+        // log_error(srv->errh, __FILE__, __LINE__,
+        //     "total login entires: %d", count);
     }
 
     return HANDLER_GO_ON;
@@ -244,11 +301,18 @@ INIT_FUNC(mod_auth_init) {
 	p->ratelimit_allowed_fails = 5; // hardcoded. -1;
 	p->ratelimit_backoff_sec = 300; // 0
 
+    // init login map
+    map_init(&p->logins);
+
 	return p;
 }
 
 FREE_FUNC(mod_auth_free) {
     plugin_data * const p = p_d;
+
+    // deinit login map
+    map_deinit(&p->logins);
+
     if (NULL == p->cvlist) return;
     /* (init i to 0 if global context; to 1 to skip empty global context) */
     for (int i = !p->cvlist[0].v.u2[1], used = p->nconfig; i < used; ++i) {
@@ -1045,8 +1109,10 @@ mod_auth_digest_mutate (http_auth_info_t * const ai, const http_auth_digest_para
 
 
 static void
-mod_auth_append_nonce (buffer *b, unix_time64_t cur_ts, const struct http_auth_require_t *require, int dalgo, int *rndptr)
+mod_auth_append_nonce (buffer *b, unix_time64_t cur_ts, const struct http_auth_require_t *require, int dalgo, int *rndptr, plugin_data *p_d)
 {
+    const uint32_t bufferUsed = b->used;
+
     buffer_append_uint_hex(b, (uintmax_t)cur_ts);
     buffer_append_char(b, ':');
     const buffer * const nonce_secret = require->nonce_secret;
@@ -1105,11 +1171,26 @@ mod_auth_append_nonce (buffer *b, unix_time64_t cur_ts, const struct http_auth_r
         break;
     }
     li_tohex(buffer_extend(b, n*2), n*2+1, (const char *)h, n);
+
+    // store the nonce
+    {
+        int len = b->used - bufferUsed;
+        char* key = malloc(sizeof(char) * ( len +1));
+        strncpy(key, b->ptr + bufferUsed -1, len);
+        key[len] = '\0';
+
+        login_entry* entry = malloc(sizeof(login_entry));
+        entry->created_time = log_monotonic_secs;
+        entry->last_time = 0;
+        entry->last_nc = 0;
+
+        map_set(&p_d->logins, key, (void*)entry);
+    }
 }
 
 
 static void
-mod_auth_digest_www_authenticate (buffer *b, unix_time64_t cur_ts, const struct http_auth_require_t *require, int nonce_stale)
+mod_auth_digest_www_authenticate (buffer *b, unix_time64_t cur_ts, const struct http_auth_require_t *require, int nonce_stale, plugin_data *p_d)
 {
     int algos = nonce_stale ? nonce_stale : require->algorithm;
     int n = 0;
@@ -1150,7 +1231,7 @@ mod_auth_digest_www_authenticate (buffer *b, unix_time64_t cur_ts, const struct 
          ,{ CONST_STR_LEN(", nonce=\"") }
         };
         buffer_append_iovec(b, iov+(0==i), sizeof(iov)/sizeof(*iov)-(0==i));
-        mod_auth_append_nonce(b, cur_ts, require, algoid[i], NULL);
+        mod_auth_append_nonce(b, cur_ts, require, algoid[i], NULL, p_d);
         buffer_append_string_len(b, CONST_STR_LEN("\", qop=\"auth\""));
         if (require->userhash) {
             buffer_append_string_len(b, CONST_STR_LEN(", userhash=true"));
@@ -1180,24 +1261,24 @@ mod_auth_send_429_too_many_requests(request_st * const r, const struct http_auth
 
 __attribute_noinline__
 static handler_t
-mod_auth_send_401_unauthorized_digest(request_st * const r, const struct http_auth_require_t * const require, int nonce_stale)
+mod_auth_send_401_unauthorized_digest(request_st * const r, const struct http_auth_require_t * const require, int nonce_stale, plugin_data *p_d)
 {
     r->http_status = 401;
     r->handler_module = NULL;
     mod_auth_digest_www_authenticate(
       http_header_response_set_ptr(r, HTTP_HEADER_WWW_AUTHENTICATE,
                                    CONST_STR_LEN("WWW-Authenticate")),
-      log_epoch_secs, require, nonce_stale);
+      log_epoch_secs, require, nonce_stale, p_d);
     return HANDLER_FINISHED;
 }
 
 
 static void
-mod_auth_digest_authentication_info (buffer *b, unix_time64_t cur_ts, const struct http_auth_require_t *require, int dalgo)
+mod_auth_digest_authentication_info (buffer *b, unix_time64_t cur_ts, const struct http_auth_require_t *require, int dalgo,  plugin_data *p_d)
 {
     buffer_clear(b);
     buffer_append_string_len(b, CONST_STR_LEN("nextnonce=\""));
-    mod_auth_append_nonce(b, cur_ts, require, dalgo, NULL);
+    mod_auth_append_nonce(b, cur_ts, require, dalgo, NULL, p_d);
     buffer_append_char(b, '"');
 }
 
@@ -1262,7 +1343,7 @@ mod_auth_digest_get (request_st * const r, void *p_d, const struct http_auth_req
     case HANDLER_ERROR:
     default:
         r->keep_alive = -1; /*(disable keep-alive if unknown user)*/
-        return mod_auth_send_401_unauthorized_digest(r, require, 0);
+        return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
     }
 
     if (sptree && NULL == ae) { /*(cache digest from backend)*/
@@ -1430,7 +1511,7 @@ mod_auth_digest_validate_userstar (request_st * const r, http_auth_digest_params
 
 
 static handler_t
-mod_auth_digest_validate_params (request_st * const r, const struct http_auth_require_t * const require, http_auth_digest_params_t * const dp, http_auth_info_t * const ai)
+mod_auth_digest_validate_params (request_st * const r, const struct http_auth_require_t * const require, http_auth_digest_params_t * const dp, http_auth_info_t * const ai, plugin_data *p_d)
 {
     /* check for required parameters */
     if ((!dp->ptr[e_qop] || (dp->ptr[e_nc] && dp->ptr[e_cnonce]))
@@ -1458,7 +1539,7 @@ mod_auth_digest_validate_params (request_st * const r, const struct http_auth_re
     if (!buffer_eq_slen(require->realm, ai->realm, ai->rlen)) {
         log_error(r->conf.errh, __FILE__, __LINE__,
           "digest: realm mismatch");
-        return mod_auth_send_401_unauthorized_digest(r, require, 0);
+        return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
     }
 
     if (!mod_auth_algorithm_parse(ai,dp->ptr[e_algorithm],dp->len[e_algorithm])
@@ -1466,7 +1547,7 @@ mod_auth_digest_validate_params (request_st * const r, const struct http_auth_re
         log_error(r->conf.errh, __FILE__, __LINE__,
           "digest: (%.*s): invalid",
           (int)dp->len[e_algorithm], dp->ptr[e_algorithm]);
-        return mod_auth_send_401_unauthorized_digest(r, require, 0);
+        return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
     }
 
     /* *-sess requires nonce and cnonce */
@@ -1514,7 +1595,7 @@ mod_auth_digest_validate_params (request_st * const r, const struct http_auth_re
 
 
 static handler_t
-mod_auth_digest_validate_nonce (request_st * const r, const struct http_auth_require_t * const require, http_auth_digest_params_t * const dp, http_auth_info_t * const ai)
+mod_auth_digest_validate_nonce (request_st * const r, const struct http_auth_require_t * const require, http_auth_digest_params_t * const dp, http_auth_info_t * const ai, plugin_data *p_d)
 {
     /* check age of nonce.  Note, random data is used in nonce generation
      * in mod_auth_send_401_unauthorized_digest().  If that were replaced
@@ -1541,7 +1622,7 @@ mod_auth_digest_validate_nonce (request_st * const r, const struct http_auth_req
     const unix_time64_t cur_ts = log_epoch_secs;
     if (nonce[i] != ':' || ts > cur_ts || cur_ts - ts > 600) { /*(10 mins)*/
         /* nonce is stale; have client regenerate digest */
-        return mod_auth_send_401_unauthorized_digest(r, require, ai->dalgo);
+        return mod_auth_send_401_unauthorized_digest(r, require, ai->dalgo, p_d);
     }
 
     if (cur_ts - ts > 540)  /*(9 mins)*/
@@ -1561,12 +1642,12 @@ mod_auth_digest_validate_nonce (request_st * const r, const struct http_auth_req
         }
         buffer * const tb = r->tmp_buf;
         buffer_clear(tb);
-        mod_auth_append_nonce(tb, cur_ts, require, ai->dalgo, (int *)&rnd);
+        mod_auth_append_nonce(tb, cur_ts, require, ai->dalgo, (int *)&rnd, p_d);
         if (!buffer_eq_slen(tb, dp->ptr[e_nonce], dp->len[e_nonce])) {
             /* nonce not generated using current require->nonce_secret */
             log_error(r->conf.errh, __FILE__, __LINE__,
               "digest: nonce mismatch");
-            return mod_auth_send_401_unauthorized_digest(r, require, 0);
+            return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
         }
     }
 
@@ -1588,7 +1669,7 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
                               CONST_STR_LEN("Authorization"));
     if (NULL == vb || !buffer_eq_icase_ssn(vb->ptr, CONST_STR_LEN("Digest "))) {
         ratelimit_auth_failed(r, p_d);
-        return mod_auth_send_401_unauthorized_digest(r, require, 0);
+        return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
     }
   #ifdef __COVERITY__
     if (buffer_clen(vb) < sizeof("Digest ")-1)
@@ -1604,17 +1685,23 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
 
     mod_auth_digest_parse_authorization(&dp, vb->ptr + sizeof("Digest ")-1);
 
-    rc = mod_auth_digest_validate_params(r, require, &dp, &ai);
-    if (__builtin_expect( (HANDLER_GO_ON != rc), 0))
+    rc = mod_auth_digest_validate_params(r, require, &dp, &ai, p_d);
+    if (__builtin_expect( (HANDLER_GO_ON != rc), 0)) {
+        ratelimit_auth_failed(r, p_d);
         return rc;
+    }
 
-    rc = mod_auth_digest_validate_nonce(r, require, &dp, &ai);
-    if (__builtin_expect( (HANDLER_GO_ON != rc), 0))
+    rc = mod_auth_digest_validate_nonce(r, require, &dp, &ai, p_d);
+    if (__builtin_expect( (HANDLER_GO_ON != rc), 0)) {
+        ratelimit_auth_failed(r, p_d);
         return rc;
+    }
 
     rc = mod_auth_digest_get(r, p_d, require, backend, &ai);
-    if (__builtin_expect( (HANDLER_GO_ON != rc), 0))
+    if (__builtin_expect( (HANDLER_GO_ON != rc), 0)) {
+        ratelimit_auth_failed(r, p_d);
         return rc;
+    }
 
     mod_auth_digest_mutate(&ai, &dp, http_method_buf(r->http_method));
 
@@ -1626,7 +1713,7 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
           (int)ai.ulen, ai.username, r->con->dst_addr_buf.ptr);
         r->keep_alive = -1; /*(disable keep-alive if bad password)*/
         ratelimit_auth_failed(r, p_d);
-        return mod_auth_send_401_unauthorized_digest(r, require, 0);
+        return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
     }
     /*ck_memzero(ai.digest, ai.dlen);*//* skip clear since mutated */
 
@@ -1635,7 +1722,7 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
     buffer_copy_string_len(tb, ai.username, ai.ulen);
     if (!http_auth_match_rules(require, tb->ptr, NULL, NULL)) {
         ratelimit_auth_failed(r, p_d);
-        return mod_auth_send_401_unauthorized_digest(r, require, 0);
+        return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
     }
 
     if (dp.send_nextnonce_ts) {
@@ -1643,7 +1730,70 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
         mod_auth_digest_authentication_info(
           http_header_response_set_ptr(r, HTTP_HEADER_OTHER,
                                        CONST_STR_LEN("Authentication-Info")),
-          dp.send_nextnonce_ts /*(cur_ts)*/, require, ai.dalgo);
+          dp.send_nextnonce_ts /*(cur_ts)*/, require, ai.dalgo, p_d);
+    }
+
+
+    // validate a nonce
+    {
+        plugin_data *p = (plugin_data *)p_d;
+        map_void_t *map = &p->logins;
+        login_entry *entry = NULL;
+
+        char key[512];  // fixme : max
+        strncpy(key, dp.ptr[e_nonce], dp.len[e_nonce]);
+        key[dp.len[e_nonce]] = '\0';
+        long int nc = (int)strtol((unsigned char *)dp.ptr[e_nc], NULL, 16);
+
+        // fixme : this not work.
+        // login_entry* entry = (login_entry*)map_get(map, key);
+        {
+            const char *k;
+            map_iter_t iter = map_iter(map);
+            while ((k = map_next(map, &iter))) {
+                if (strcmp(k, key) == 0) {
+                    entry = *map_get(map, k);
+                    log_error(r->conf.errh, __FILE__, __LINE__,
+                        "FOUND!! server's login entry to check. nonce: `%s`, nc: %ld, created_time: %d, last_time: %d, cur: %d, diff: %d",
+                        key, entry->last_nc, entry->created_time, entry->last_time, log_monotonic_secs, (log_monotonic_secs - entry->last_time));
+                    break;
+                }
+            }
+        }
+
+        if (entry == NULL) {
+            log_error(r->conf.errh, __FILE__, __LINE__,
+                "ERROR!! the given nonce is not generated by server. nonce: `%s`", key);
+
+            return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
+        }
+
+        log_error(r->conf.errh, __FILE__, __LINE__,
+            "server's login entry to check. nonce: `%s`, nc: %ld, created_time: %d, last_time: %d, cur: %d, diff: %d",
+            key, entry->last_nc, entry->created_time, entry->last_time, log_monotonic_secs, (log_monotonic_secs - entry->last_time));
+
+        if (entry->last_time != 0) {    // not first seen
+            if ((log_monotonic_secs - entry->last_time) > LOGIN_TIMEOUT) {
+                log_error(r->conf.errh, __FILE__, __LINE__,
+                    "ERROR!! entry->last_time is over 600 secs. nonce: `%s`, last_time: %d, cur: %d, diff: %d",
+                    key, entry->last_time, log_monotonic_secs, (log_monotonic_secs - entry->last_time));
+
+                // delete the entry
+                map_remove(map, key);
+
+                return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
+            }
+
+
+            if (nc < entry->last_nc) {
+                log_error(r->conf.errh, __FILE__, __LINE__,
+                    "ERROR!! entry->nc is not increased. nonce: `%s`, last_nc: %ld, request_nc: %ld", key, entry->last_nc, nc);
+                return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
+            }
+        }
+
+        entry->last_time = log_monotonic_secs;
+        entry->last_nc = nc;
     }
 
     http_auth_setenv(r, ai.username, ai.ulen, CONST_STR_LEN("Digest"));

@@ -48,7 +48,7 @@ BUILT_SOURCES = parsers versionstamp
 MAINTAINERCLEANFILES = configparser.c configparser.h
 CLEANFILES = versionstamp.h versionstamp.h.tmp lemon$(BUILD_EXEEXT)
 
-common_src=base64.c buffer.c burl.c log.c \
+common_src=base64.c buffer.c burl.c log.c map.c \
 	http_header.c http_kv.c keyvalue.c chunk.c  \
 	http_chunk.c fdevent.c fdevent_fdnode.c gw_backend.c \
 	stat_cache.c http_etag.c array.c \
@@ -287,7 +287,7 @@ if !NO_RDYNAMIC
 mod_auth_la_SOURCES += mod_auth_api.c
 endif
 mod_auth_la_LDFLAGS = $(common_module_ldflags)
-mod_auth_la_LIBADD = $(CRYPTO_LIB) $(common_libadd)
+mod_auth_la_LIBADD = $(CRYPTO_LIB) $(common_libadd) map.o
 
 lib_LTLIBRARIES += mod_authn_file.la
 mod_authn_file_la_SOURCES = mod_authn_file.c
@@ -402,7 +402,7 @@ mod_wstunnel_la_LDFLAGS = $(common_module_ldflags)
 mod_wstunnel_la_LIBADD = $(common_libadd) $(CRYPTO_LIB)
 
 
-hdr = base64.h buffer.h burl.h network.h log.h http_kv.h keyvalue.h \
+hdr = base64.h buffer.h burl.h network.h log.h map.h http_kv.h keyvalue.h \
 	response.h request.h reqpool.h chunk.h h2.h \
 	first.h http_chunk.h \
 	algo_hmac.h \
@@ -567,12 +567,13 @@ t_test_common_SOURCES = t/test_common.c \
                         t/test_keyvalue.c \
                         t/test_request.c \
                         log.c \
+						map.c \
                         fdlog.c \
                         sock_addr.c \
                         ck.c
 t_test_common_LDADD   = $(LIBUNWIND_LIBS) $(PCRE_LIB)
 
-t_test_configfile_SOURCES = t/test_configfile.c buffer.c array.c data_config.c http_header.c http_kv.c vector.c log.c fdlog.c sock_addr.c ck.c
+t_test_configfile_SOURCES = t/test_configfile.c buffer.c array.c data_config.c http_header.c http_kv.c vector.c log.c map.c fdlog.c sock_addr.c ck.c
 t_test_configfile_LDADD = $(PCRE_LIB) $(LIBUNWIND_LIBS)
 
 t_test_mod_SOURCES = $(common_src) t/test_mod.c \
