@@ -28,8 +28,8 @@
  * auth framework
  */
 
-#define LOGIN_SESSION_TIMEOUT (600)
-#define LOGIN_POPUP_TIMEOUT (60)
+#define LOGIN_SESSION_TIMEOUT (300)
+#define LOGIN_POPUP_TIMEOUT (30)
 
 typedef struct {
     splay_tree *sptree; /* data in nodes of tree are (http_auth_cache_entry *)*/
@@ -1769,8 +1769,13 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
             const char *k;
             map_iter_t iter = map_iter(map);
             while ((k = map_next(map, &iter))) {
-                entry = *map_get(map, key);
-                break;
+                if (strcmp(k, key) == 0) {
+                    entry = *map_get(map, k);
+                    log_error(r->conf.errh, __FILE__, __LINE__,
+                        "FOUND!! server's login entry to check. nonce: `%s`, nc: %ld, created_time: %d, last_time: %d, cur: %d, diff: %d",
+                        key, entry->last_nc, entry->created_time, entry->last_time, log_monotonic_secs, (log_monotonic_secs - entry->last_time));
+                    break;
+                }
             }
         }
 
