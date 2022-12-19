@@ -28,7 +28,8 @@
  * auth framework
  */
 
-#define LOGIN_TIMEOUT (600)
+#define LOGIN_SESSION_TIMEOUT (600)
+#define LOGIN_POPUP_TIMEOUT (60)
 
 typedef struct {
     splay_tree *sptree; /* data in nodes of tree are (http_auth_cache_entry *)*/
@@ -236,23 +237,25 @@ TRIGGER_FUNC(mod_auth_periodic)
             login_entry *entry = *map_get(&p->logins, key);
 
             if (entry->last_time == 0) {
-                if ((log_monotonic_secs - entry->created_time) > LOGIN_TIMEOUT) {
+                if ((log_monotonic_secs - entry->created_time) > LOGIN_POPUP_TIMEOUT) {
                     log_error(srv->errh, __FILE__, __LINE__,
-                        "cleanup: entry->created_time is over 600 secs. remove unused entry. nonce: %s, created_time: %d", key, entry->created_time);
+                        "cleanup: entry->created_time is over %d secs.remove unused entry. nonce: %s, created_time: %ld", LOGIN_POPUP_TIMEOUT, key, entry->created_time);
 
                     // delete the entry
                     map_remove(&((plugin_data *)p_d)->logins, key);
+                    free(entry);
                     continue;
                 }
             }
 
             if (entry->last_time != 0) {
-                if ((log_monotonic_secs - entry->last_time) > LOGIN_TIMEOUT) {
+                if ((log_monotonic_secs - entry->last_time) > LOGIN_SESSION_TIMEOUT) {
                     log_error(srv->errh, __FILE__, __LINE__,
-                        "cleanup: entry->last_time is over 600 secs. remove old entry nonce: %s, last_time: %d", key, entry->last_time);
+                        "cleanup: entry->last_time is over %d secs. remove old entry. nonce: %s, last_time: %ld", LOGIN_SESSION_TIMEOUT, key, entry->last_time);
 
                     // delete the entry
                     map_remove(&((plugin_data *)p_d)->logins, key);
+                    free(entry);
                     continue;
                 }
             }
@@ -265,7 +268,11 @@ TRIGGER_FUNC(mod_auth_periodic)
             count++;
             login_entry *entry = *map_get(&p->logins, key);
             log_error(srv->errh, __FILE__, __LINE__,
-                "login entry. nonce: `%s`, nc: %ld, created_time: %d, last_time:%d", key, entry->last_nc, entry->created_time, entry->last_time);
+                "login entry. nonce: `%s`, nc: %ld, created_time: %ld, last_time: %ld, remains: %ld",
+                key, entry->last_nc, entry->created_time, entry->last_time,
+                entry->last_time == 0 ?
+                    ((entry->created_time + LOGIN_POPUP_TIMEOUT) - log_monotonic_secs) :
+                    ((entry->last_time + LOGIN_SESSION_TIMEOUT) - log_monotonic_secs));
         }
 
         // log_error(srv->errh, __FILE__, __LINE__,
@@ -310,6 +317,15 @@ INIT_FUNC(mod_auth_init) {
 FREE_FUNC(mod_auth_free) {
     plugin_data * const p = p_d;
 
+
+    // free all items
+    const char *k;
+    map_iter_t iter = map_iter(&p->logins);
+    while ((k = map_next(&p->logins, &iter))) {
+        login_entry *entry = *map_get(&p->logins, k);
+        map_remove(&p->logins, k);
+        free(entry);
+    }
     // deinit login map
     map_deinit(&p->logins);
 
@@ -1246,6 +1262,8 @@ __attribute_noinline__
 static handler_t
 mod_auth_send_429_too_many_requests(request_st * const r, const struct http_auth_require_t * const require, plugin_data *p)
 {
+    UNUSED(require);
+
     r->http_status = 429;
     r->handler_module = NULL;
     
@@ -1740,10 +1758,10 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
         map_void_t *map = &p->logins;
         login_entry *entry = NULL;
 
-        char key[512];  // fixme : max
+        char key[256];  // fixme : max
         strncpy(key, dp.ptr[e_nonce], dp.len[e_nonce]);
         key[dp.len[e_nonce]] = '\0';
-        long int nc = (int)strtol((unsigned char *)dp.ptr[e_nc], NULL, 16);
+        long int nc = (long int)strtol((unsigned char *)dp.ptr[e_nc], NULL, 16);
 
         // fixme : this not work.
         // login_entry* entry = (login_entry*)map_get(map, key);
@@ -1751,13 +1769,8 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
             const char *k;
             map_iter_t iter = map_iter(map);
             while ((k = map_next(map, &iter))) {
-                if (strcmp(k, key) == 0) {
-                    entry = *map_get(map, k);
-                    log_error(r->conf.errh, __FILE__, __LINE__,
-                        "FOUND!! server's login entry to check. nonce: `%s`, nc: %ld, created_time: %d, last_time: %d, cur: %d, diff: %d",
-                        key, entry->last_nc, entry->created_time, entry->last_time, log_monotonic_secs, (log_monotonic_secs - entry->last_time));
-                    break;
-                }
+                entry = *map_get(map, key);
+                break;
             }
         }
 
@@ -1769,17 +1782,18 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
         }
 
         log_error(r->conf.errh, __FILE__, __LINE__,
-            "server's login entry to check. nonce: `%s`, nc: %ld, created_time: %d, last_time: %d, cur: %d, diff: %d",
+            "server's login entry to check. nonce: `%s`, nc: %ld, created_time: %ld, last_time: %ld, cur: %ld, diff: %ld",
             key, entry->last_nc, entry->created_time, entry->last_time, log_monotonic_secs, (log_monotonic_secs - entry->last_time));
 
         if (entry->last_time != 0) {    // not first seen
-            if ((log_monotonic_secs - entry->last_time) > LOGIN_TIMEOUT) {
+            if ((log_monotonic_secs - entry->last_time) > LOGIN_SESSION_TIMEOUT) {
                 log_error(r->conf.errh, __FILE__, __LINE__,
-                    "ERROR!! entry->last_time is over 600 secs. nonce: `%s`, last_time: %d, cur: %d, diff: %d",
-                    key, entry->last_time, log_monotonic_secs, (log_monotonic_secs - entry->last_time));
+                    "TIMEOUT!! entry->last_time is over %d secs. nonce: `%s`, last_time: %ld, cur: %ld, diff: %ld",
+                    LOGIN_SESSION_TIMEOUT, key, entry->last_time, log_monotonic_secs, (log_monotonic_secs - entry->last_time));
 
                 // delete the entry
                 map_remove(map, key);
+                free(entry);
 
                 return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
             }
