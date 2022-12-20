@@ -1640,7 +1640,9 @@ mod_auth_digest_validate_nonce (request_st * const r, const struct http_auth_req
     const unix_time64_t cur_ts = log_epoch_secs;
     if (nonce[i] != ':' || ts > cur_ts || cur_ts - ts > 600) { /*(10 mins)*/
         /* nonce is stale; have client regenerate digest */
-        return mod_auth_send_401_unauthorized_digest(r, require, ai->dalgo, p_d);
+
+        // * LF policy. always needs to re-login. (do not send `stale=true`)
+        return mod_auth_send_401_unauthorized_digest(r, require, 0 /*ai->dalgo*/, p_d);
     }
 
     if (cur_ts - ts > 540)  /*(9 mins)*/
