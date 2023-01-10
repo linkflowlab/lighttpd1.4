@@ -1805,8 +1805,8 @@ mod_auth_check_digest (request_st * const r, void *p_d, const struct http_auth_r
                 return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
             }
 
-
-            if (nc < entry->last_nc) {
+            // nc must be increased.
+            if (nc != (entry->last_nc+1)) {
                 log_error(r->conf.errh, __FILE__, __LINE__,
                     "ERROR!! entry->nc is not increased. nonce: `%s`, last_nc: %ld, request_nc: %ld", key, entry->last_nc, nc);
                 return mod_auth_send_401_unauthorized_digest(r, require, 0, p_d);
