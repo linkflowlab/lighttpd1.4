@@ -37,6 +37,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _LF
+#include "lf.h"
+#endif
+
 /*(not needed)*/
 /* correction; needed for:
  *   SSL_load_client_CA_file()
@@ -1350,7 +1354,25 @@ mod_openssl_evp_pkey_load_pem_file (const char *file, log_error_st *errh)
     EVP_PKEY *x = NULL;
     BIO *in = BIO_new_mem_buf(data, (int)dlen);
     if (NULL != in) {
+#ifdef _LF
+        char passphrase[128] = {'\0', };
+        int passphrase_len = 0;
+
+        if (lf_rsa_load_passphrase(passphrase, &passphrase_len) != SUCC) {
+            log_error(errh, __FILE__, __LINE__,
+              "LF: unable to load the passphrase.");
+            return NULL;
+        }
+
+        log_error(errh, __FILE__, __LINE__,
+          "LF: passphrase loaded.");
+
+        x = PEM_read_bio_PrivateKey(in, NULL, NULL, passphrase);
+#else
+        log_error(errh, __FILE__, __LINE__,
+          "LF: without passphrase feature ");
         x = PEM_read_bio_PrivateKey(in, NULL, NULL, NULL);
+#endif
         BIO_free(in);
     }
     if (dlen) ck_memzero(data, dlen);
