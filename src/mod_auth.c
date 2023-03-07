@@ -305,7 +305,7 @@ INIT_FUNC(mod_auth_init) {
 
 	p->ratelimit_failed_requests = 0;
 	p->ratelimit_backoff_until = 0;
-	p->ratelimit_allowed_fails = 5; // hardcoded. -1;
+	p->ratelimit_allowed_fails = 4; // hardcoded. -1;
 	p->ratelimit_backoff_sec = 300; // 0
 
     // init login map
@@ -475,7 +475,7 @@ static uint8_t ratelimit_reached(request_st * const r, plugin_data *p) {
 static void ratelimit_auth_failed(request_st * const r, plugin_data *p) {
 	if (p->ratelimit_allowed_fails < 0)
 		return;
-	if (p->ratelimit_failed_requests > p->ratelimit_allowed_fails)
+	if (p->ratelimit_failed_requests >= p->ratelimit_allowed_fails)
 		p->ratelimit_backoff_until = ratelimit_current_time() + p->ratelimit_backoff_sec;
 	else
 		p->ratelimit_failed_requests += 1;
